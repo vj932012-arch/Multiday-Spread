@@ -77,21 +77,4 @@ def run_screener():
 
 # --- MAIN SCHEDULER LOOP ---
 if __name__ == "__main__":
-    print("Bot is active. Waiting for market hours to send hourly alerts...")
-    
-    while True:
-        now = datetime.datetime.now()
-        
-        # Only trigger Monday (0) to Friday (4)
-        if now.weekday() < 5:
-            # Only trigger between 9:00 AM and 4:00 PM
-            if 9 <= now.hour <= 16:
-                # Trigger at the exact top of the hour (minute 0)
-                if now.minute == 0:
-                    run_screener()
-                    # Sleep for 61 seconds so it doesn't trigger twice in the same minute
-                    time.sleep(61)
-                    continue
-        
-        # Check the clock every 30 seconds
-        time.sleep(30)
+    run_daily_scan()
