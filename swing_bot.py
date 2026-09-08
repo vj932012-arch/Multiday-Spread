@@ -1,80 +1,104 @@
-import time
+import os
 import datetime
 import pandas as pd
 import yfinance as yf
+import pandas_ta as ta
 import requests
 
-# --- CONFIGURATION ---
-# Get these for free by creating a bot via "BotFather" on Telegram
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
-TICKERS = ["SPY", "QQQ"]
+# --- SECRETS LOADED FROM GITHUB ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TICKERS = ["SPY", "QQQ", "NVDA", "GOOGL", "AAPL", "AMZN"]
 
 def send_telegram_message(message: str):
     """Sends a push notification directly to your phone via Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing Telegram credentials. Ensure secrets are set in GitHub.")
+        return
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    
     try:
-        requests.post(url, json=payload)
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        print("Telegram message sent successfully.")
     except Exception as e:
         print(f"Failed to send message: {e}")
 
-def get_intraday_data(ticker: str) -> pd.DataFrame:
-    """Fetches intraday 5-minute bars and calculates VWAP and EMAs."""
-    df = yf.download(ticker, period="5d", interval="5m", progress=False)
-    if df.empty:
-        return df
+def get_daily_signals(ticker: str):
+    """Fetches daily data and calculates swing thresholds."""
+    df = yf.Ticker(ticker).history(period="1y", interval="1d")
+    if df.empty: return None
     
-    # Flatten multi-index columns if present (yfinance quirk)
+    # Flatten yfinance MultiIndex if it exists
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-        
     df.columns = [c.lower() for c in df.columns]
     
-    # Calculate 9 EMA and 200 EMA
-    df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
+    # Moving Averages & Volatility
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
     
-    # Calculate Session VWAP
-    df["date"] = df.index.date
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["cum_vp"] = (typical_price * df["volume"]).groupby(df["date"]).cumsum()
-    df["cum_vol"] = df["volume"].groupby(df["date"]).cumsum()
-    df["vwap"] = df["cum_vp"] / df["cum_vol"]
-    
-    return df
-
-def analyze_trend(ticker: str, df: pd.DataFrame) -> str:
-    """Evaluates the latest price action against your 0DTE debit spread strategy."""
-    latest = df.iloc[-1]
-    
-    ema_9 = latest["ema_9"]
-    ema_200 = latest["ema_200"]
-    vwap = latest["vwap"]
-    current_price = latest["close"]
-    
-    # Your Strategy Logic
-    if ema_9 > vwap and ema_200 > vwap:
-        return f"🟢 **{ticker} 0DTE CALL Debit Spread**\nPrice: ${current_price:.2f} | Both 9 EMA & 200 EMA are established ABOVE VWAP. Momentum is bullish."
-    elif ema_9 < vwap and ema_200 < vwap:
-        return f"🔴 **{ticker} 0DTE PUT Debit Spread**\nPrice: ${current_price:.2f} | Both 9 EMA & 200 EMA are established BELOW VWAP. Momentum is bearish."
+    # ADX / DMI for Trend Strength
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+    if adx_df is not None:
+        df = pd.concat([df, adx_df], axis=1)
     else:
-        return f"⚪ **{ticker} No Clear Signal**\nPrice: ${current_price:.2f} | EMAs are crossing VWAP boundaries. Wait for structural alignment."
+        df["ADX_14"], df["DMP_14"], df["DMN_14"] = 0.0, 0.0, 0.0
 
-def run_screener():
-    """Runs the analysis and sends the formatted alert."""
-    messages = [f"🎯 **Hourly 0DTE Options Screener** ({datetime.datetime.now().strftime('%H:%M ET')})\n"]
+    latest = df.iloc[-1]
+    price = latest["close"]
+    atr = latest["atr"]
+    
+    # Call/Put Triggers
+    call_trigger = (
+        price > latest["ema_50"] and latest["ema_20"] > latest["ema_50"] and 
+        45 <= latest["rsi"] <= 70 and latest["ADX_14"] >= 20 and latest["DMP_14"] > latest["DMN_14"]
+    )
+    
+    put_trigger = (
+        price < latest["ema_50"] and latest["ema_20"] < latest["ema_50"] and 
+        30 <= latest["rsi"] <= 55 and latest["ADX_14"] >= 20 and latest["DMN_14"] > latest["DMP_14"]
+    )
+    
+    # Dynamic Strike Calculations based on ATR
+    spread_width = max(round(atr), 1)
+    
+    if call_trigger:
+        long_strike = round(price)
+        short_strike = long_strike + spread_width
+        return f"🟢 **{ticker} CALL SPREAD**\nPrice: ${price:.2f} | Buy ${long_strike}C / Sell ${short_strike}C"
+    elif put_trigger:
+        long_strike = round(price)
+        short_strike = long_strike - spread_width
+        return f"🔴 **{ticker} PUT SPREAD**\nPrice: ${price:.2f} | Buy ${long_strike}P / Sell ${short_strike}P"
+        
+    return None
+
+def run_daily_swing_scan():
+    """Runs the analysis on all tickers and sends the formatted alert."""
+    print(f"Starting Multi-Day Swing Scan for {len(TICKERS)} tickers...")
+    messages = [f"🔭 **Daily Swing Trade Scan** ({datetime.datetime.now().strftime('%b %d, %Y')})\n"]
+    triggers = 0
     
     for ticker in TICKERS:
-        df = get_intraday_data(ticker)
-        if not df.empty:
-            result = analyze_trend(ticker, df)
-            messages.append(result)
+        signal = get_daily_signals(ticker)
+        if signal:
+            messages.append(signal)
+            triggers += 1
             
+    if triggers == 0:
+        messages.append("⚪ No clear swing setups triggered today.")
+        
     final_message = "\n\n".join(messages)
     print(final_message)
     send_telegram_message(final_message)
 
-# --- MAIN SCHEDULER LOOP ---
+# --- SINGLE EXECUTION BLOCK ---
+# Because GitHub Actions handles the cron scheduling via the YAML file, 
+# this script just executes exactly once and shuts down immediately.
 if __name__ == "__main__":
-   run_screener()
+    run_daily_swing_scan()
